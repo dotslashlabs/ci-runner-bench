@@ -43,7 +43,7 @@ env:
 
 jobs:
   setup:
-    runs-on: ubuntu-24.04
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     outputs:
       runners: ${{ steps.m.outputs.matrix }}
     steps:

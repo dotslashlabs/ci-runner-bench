@@ -153,6 +153,8 @@ def gather(jobs: list[dict], steps: list[dict]) -> dict:
     """Build the metric store: metric key -> vendor -> list of samples."""
     store: dict[str, dict[str, list[float]]] = defaultdict(
         lambda: defaultdict(list))
+    # pairs[metric key][run id][vendor] = value, for within-slot ratios.
+    pairs: dict = defaultdict(lambda: defaultdict(dict))
     work_s = workload_step_seconds(steps)
     paired = paired_runs(jobs)
     store["unpaired"]["_"] = []
@@ -187,11 +189,15 @@ def gather(jobs: list[dict], steps: list[dict]) -> dict:
         work = work_s.get(row["job_id"], duration)
 
         if arm == "a" and workload in ("w1", "w2", "w4", "w5"):
-            store[f"dur:{workload}:{cache_arm}"][vendor].append(work)
+            key = f"dur:{workload}:{cache_arm}"
+            store[key][vendor].append(work)
             store[f"job:{workload}:{cache_arm}"][vendor].append(duration)
+            pairs[key][row["run_id"]][vendor] = work
+
             billable = -(-duration // 60)
-            store[f"cost:{workload}:{cache_arm}"][vendor].append(
-                billable * PRICE_PER_MIN.get(vendor, 0.0))
+            cost = billable * PRICE_PER_MIN.get(vendor, 0.0)
+            store[f"cost:{workload}:{cache_arm}"][vendor].append(cost)
+            pairs[f"cost:{workload}:{cache_arm}"][row["run_id"]][vendor] = cost
 
         if arm == "b" and workload in ("w1", "w2"):
             store[f"durB:{workload}:{cache_arm}"][vendor].append(work)
@@ -204,6 +210,7 @@ def gather(jobs: list[dict], steps: list[dict]) -> dict:
             continue
 
         if name == "Restore cache payload":
+            pairs["cache_restore_s"][row["run_id"]][vendor] = seconds
             store["cache_restore_s"][vendor].append(seconds)
             if seconds > 0:
                 store["cache_restore_mbps"][vendor].append(PAYLOAD_MB / seconds)
@@ -215,7 +222,7 @@ def gather(jobs: list[dict], steps: list[dict]) -> dict:
         elif name == "Pull large image":
             store["image_pull_s"][vendor].append(seconds)
 
-    return store
+    return store, pairs
 
 
 def median_of(store: dict, key: str, vendor: str) -> float | None:
@@ -223,11 +230,44 @@ def median_of(store: dict, key: str, vendor: str) -> float | None:
     return st.median(values) if values else None
 
 
-def resolve(store: dict, metric: str, vendor: str) -> tuple:
+def per_slot_ratios(pairs: dict, key: str, vendor: str) -> list[float]:
+    """GitHub divided by vendor, computed inside each slot then collected.
+
+    Pairing inside a slot removes anything that moved both runners together,
+    such as registry latency or time of day. It is the correct estimator here
+    because every slot ran both runners on the same commit.
+    """
+    out = []
+    for _run, byvendor in pairs.get(key, {}).items():
+        base, vend = byvendor.get(BASELINE), byvendor.get(vendor)
+        if base and vend and vend > 0:
+            out.append(base / vend)
+    return out
+
+
+def bootstrap_ci(values: list[float],
+                 rounds: int = BOOTSTRAP) -> tuple[float, float] | None:
+    """95% CI for the median of a single sample."""
+    if len(values) < 3:
+        return None
+
+    rng = random.Random(20260907)
+    meds = [st.median(rng.choices(values, k=len(values)))
+            for _ in range(rounds)]
+    return percentile(meds, 0.025), percentile(meds, 0.975)
+
+
+def resolve(store: dict, metric: str, vendor: str, pairs: dict | None = None) -> tuple:
     """Return (value, n, ci) for a metric key such as 'speedup:w1:warm'."""
     if metric.startswith("speedup:"):
         target = metric.split("speedup:", 1)[1]
         key = "cache_restore_s" if target == "cache_restore" else f"dur:{target}"
+
+        if pairs is not None:
+            ratios = per_slot_ratios(pairs, key, vendor)
+            if ratios:
+                return st.median(ratios), len(ratios), bootstrap_ci(ratios)
+
         base = store.get(key, {}).get(BASELINE, [])
         vend = store.get(key, {}).get(vendor, [])
         if not base or not vend:
@@ -239,6 +279,12 @@ def resolve(store: dict, metric: str, vendor: str) -> tuple:
     if metric.startswith("cost_ratio:"):
         target = metric.split("cost_ratio:", 1)[1]
         key = f"cost:{target}"
+
+        if pairs is not None:
+            ratios = per_slot_ratios(pairs, key, vendor)
+            if ratios:
+                return st.median(ratios), len(ratios), bootstrap_ci(ratios)
+
         base = store.get(key, {}).get(BASELINE, [])
         vend = store.get(key, {}).get(vendor, [])
         if not base or not vend:
@@ -288,19 +334,22 @@ def fmt(value: float | None, digits: int = 2) -> str:
     return "n/a" if value is None else f"{value:.{digits}f}"
 
 
-def write_verdicts(store: dict, out_dir: str) -> None:
+def write_verdicts(store: dict, out_dir: str, pairs: dict) -> None:
     lines = [
         "# Claim verdicts",
         "",
         "GitHub-hosted `ubuntu-24.04` is the baseline. A ratio above 1.0 means",
-        "the vendor beats GitHub. CI is a 95% bootstrap interval on the ratio.",
+        "the vendor beats GitHub. Speed and cost ratios are computed inside",
+        "each slot and then aggregated, so anything that moved both runners",
+        "together cancels. CI is a 95% bootstrap interval, and n is the number",
+        "of paired slots.",
         "",
         "| ID | Vendor | Claim | Metric | Measured | Threshold | 95% CI | n | Verdict |",
         "| --- | --- | --- | --- | --- | --- | --- | --- | --- |",
     ]
 
     for cid, vendor, claim, metric, comparison, threshold in CLAIMS:
-        value, n, ci = resolve(store, metric, vendor)
+        value, n, ci = resolve(store, metric, vendor, pairs)
         ci_text = f"{fmt(ci[0])} to {fmt(ci[1])}" if ci else "n/a"
         lines.append(
             f"| {cid} | {vendor} | {claim} | `{metric}` | {fmt(value)} | "
@@ -314,7 +363,7 @@ def write_verdicts(store: dict, out_dir: str) -> None:
               "| --- | --- | --- | " + " | ".join("---" for _ in VENDORS) + " |"]
 
     for cid, text, metric in REPORT_ONLY:
-        cells = [fmt(resolve(store, metric, v)[0]) for v in VENDORS]
+        cells = [fmt(resolve(store, metric, v, pairs)[0]) for v in VENDORS]
         lines.append(f"| {cid} | {text} | `{metric}` | " + " | ".join(cells) + " |")
 
     skipped = len(store.get("unpaired", {}).get("_", []))
@@ -431,9 +480,9 @@ def main() -> int:
         return 1
 
     os.makedirs(args.out, exist_ok=True)
-    store = gather(jobs, steps)
+    store, pairs = gather(jobs, steps)
 
-    write_verdicts(store, args.out)
+    write_verdicts(store, args.out, pairs)
     write_durations(store, args.out)
     print(f"analysed {len(jobs)} jobs and {len(steps)} steps")
     return 0

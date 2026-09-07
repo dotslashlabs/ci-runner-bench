@@ -18,6 +18,7 @@ import csv
 import datetime as dt
 import json
 import os
+import subprocess
 import sys
 import time
 import urllib.error
@@ -187,6 +188,25 @@ def write_csv(path: str, rows: list[dict], fields: list[str]) -> None:
     print(f"wrote {len(rows)} rows to {path}", file=sys.stderr)
 
 
+def resolve_token() -> str | None:
+    """Token from the environment, else from the gh CLI.
+
+    Falling back to `gh auth token` keeps the credential out of shell history
+    and out of any command line.
+    """
+    token = os.environ.get("GITHUB_TOKEN") or os.environ.get("GH_TOKEN")
+    if token:
+        return token
+
+    try:
+        out = subprocess.run(["gh", "auth", "token"], capture_output=True,
+                             text=True, timeout=15)
+    except (OSError, subprocess.SubprocessError):
+        return None
+
+    return out.stdout.strip() or None
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--repo", default=os.environ.get("BENCH_REPO"))
@@ -194,9 +214,10 @@ def main() -> int:
     ap.add_argument("--out-dir", default="results/raw")
     args = ap.parse_args()
 
-    token = os.environ.get("GITHUB_TOKEN")
+    token = resolve_token()
     if not token:
-        print("GITHUB_TOKEN is not set", file=sys.stderr)
+        print("No token. Set GITHUB_TOKEN or run: gh auth login",
+              file=sys.stderr)
         return 2
     if not args.repo:
         print("pass --repo or set BENCH_REPO", file=sys.stderr)

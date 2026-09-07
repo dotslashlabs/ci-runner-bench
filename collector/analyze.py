@@ -486,6 +486,28 @@ def write_durations(store: dict, out_dir: str) -> None:
     # advantage exactly repays its extra provisioning latency.
     #   base_queue + d = vendor_queue + d / r   =>   d = dq / (1 - 1/r)
     gq = percentile(store.get("queue_a", {}).get(BASELINE, []), 0.5)
+    lines += ["", "# Run-to-run consistency", "",
+              "Coefficient of variation of the workload step, lower is more",
+              "predictable. Neither vendor publishes a consistency figure, so",
+              "this is an observation rather than a claim under test.", "",
+              "| Workload | Cache | " + " | ".join([BASELINE] + VENDORS) + " |",
+              "| --- | --- | " + " | ".join("---" for _ in range(len(VENDORS) + 1))
+              + " |"]
+
+    for workload in ("w1", "w2", "w4"):
+        for arm in ("cold", "warm"):
+            key = f"dur:{workload}:{arm}"
+            if not store.get(key):
+                continue
+            cells = []
+            for vendor in [BASELINE] + VENDORS:
+                v = store[key].get(vendor, [])
+                if len(v) > 1 and st.mean(v):
+                    cells.append(f"{st.stdev(v) / st.mean(v) * 100:.1f}%")
+                else:
+                    cells.append("n/a")
+            lines.append(f"| {workload} | {arm} | " + " | ".join(cells) + " |")
+
     lines += ["", "# Break-even job length", "",
               "Below this baseline job duration the extra provisioning latency",
               "outweighs the faster execution, so the vendor is a regression.", "",

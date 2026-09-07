@@ -11,10 +11,10 @@ name: burst
 on:
   workflow_dispatch:
     inputs:
-      jobs_per_runner:
-        description: "Jobs per runner. Keep at 20 for the free-tier plan."
-        type: string
-        default: "20"
+      note:
+        description: "Unused. Job count is fixed by the matrix."
+        required: false
+        default: ""
 
 permissions:
   contents: read
@@ -31,8 +31,11 @@ jobs:
         runner:
           - { vendor: github, label: ubuntu-24.04 }
           - { vendor: blacksmith, label: blacksmith-4vcpu-ubuntu-2404 }
-        idx: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10,
-              11, 12, 13, 14, 15, 16, 17, 18, 19, 20]
+        # Twelve, not twenty. The GitHub Free plan caps hosted runners at 20
+        # concurrent jobs. Sitting at that cap would make GitHub's queue time
+        # reflect a billing-plan limit rather than provisioning speed, which
+        # would confound the boot-time comparison.
+        idx: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]
 
     steps:
       - name: Report identity and exit

@@ -55,12 +55,20 @@ CLAIMS = [
      "speedup:cache_restore", "ratio_ge", 3.5),
     ("B3", "blacksmith", "2x to 40x faster Docker builds",
      "speedup:w4:warm", "ratio_ge", 2.0),
-    ("B4", "blacksmith", "Runners boot in under 3 seconds",
+    ("B4", "blacksmith", "Runners boot in under 3 seconds, median",
      "queue_p50", "abs_le", 3.0),
+    ("B4b", "blacksmith", "Runners boot quickly under load, 95th percentile",
+     "queue_p95", "abs_le", 10.0),
     ("B5", "blacksmith", "67% total cost savings",
      "cost_ratio:w1:warm", "ratio_ge", 3.0),
     ("B6", "blacksmith", "Lightweight jobs may gain little or become slower",
      "speedup:w5:cold", "report", None),
+    ("E1", "blacksmith", "End-to-end wait including queue, monorepo warm",
+     "e2e_speedup:w1:warm", "ratio_ge", 1.8),
+    ("E2", "blacksmith", "End-to-end wait including queue, Rust build",
+     "e2e_speedup:w2:warm", "ratio_ge", 1.8),
+    ("E3", "blacksmith", "End-to-end wait including queue, short job",
+     "e2e_speedup:w5:cold", "report", None),
 ]
 
 # Claims recorded for every vendor with no pass threshold.
@@ -175,6 +183,9 @@ def gather(jobs: list[dict], steps: list[dict]) -> dict:
             store["queue"][vendor].append(queue)
             continue
 
+        if arm == "a" and queue is not None:
+            store["queue_a"][vendor].append(queue)
+
         # Skip slots that ran only one runner. Those timings are real but not
         # comparable, because nothing controls for time of day.
         if arm in ("a", "b") and row["run_id"] not in paired:
@@ -193,6 +204,11 @@ def gather(jobs: list[dict], steps: list[dict]) -> dict:
             store[key][vendor].append(work)
             store[f"job:{workload}:{cache_arm}"][vendor].append(duration)
             pairs[key][row["run_id"]][vendor] = work
+
+            if queue is not None:
+                e2e = queue + duration
+                store[f"e2e:{workload}:{cache_arm}"][vendor].append(e2e)
+                pairs[f"e2e:{workload}:{cache_arm}"][row["run_id"]][vendor] = e2e
 
             billable = -(-duration // 60)
             cost = billable * PRICE_PER_MIN.get(vendor, 0.0)
@@ -259,6 +275,14 @@ def bootstrap_ci(values: list[float],
 
 def resolve(store: dict, metric: str, vendor: str, pairs: dict | None = None) -> tuple:
     """Return (value, n, ci) for a metric key such as 'speedup:w1:warm'."""
+    if metric.startswith("e2e_speedup:"):
+        key = "e2e:" + metric.split("e2e_speedup:", 1)[1]
+        if pairs is not None:
+            ratios = per_slot_ratios(pairs, key, vendor)
+            if ratios:
+                return st.median(ratios), len(ratios), bootstrap_ci(ratios)
+        return None, 0, None
+
     if metric.startswith("speedup:"):
         target = metric.split("speedup:", 1)[1]
         key = "cache_restore_s" if target == "cache_restore" else f"dur:{target}"
@@ -295,8 +319,16 @@ def resolve(store: dict, metric: str, vendor: str, pairs: dict | None = None) ->
                 bootstrap_ratio_ci(base, vend))
 
     if metric == "queue_p50":
-        values = store.get("queue", {}).get(vendor, [])
+        # Prefer the dedicated burst test. Fall back to slot queue times,
+        # where each slot already starts about ten jobs per runner at once.
+        values = (store.get("queue", {}).get(vendor, [])
+                  or store.get("queue_a", {}).get(vendor, []))
         return percentile(values, 0.5), len(values), None
+
+    if metric == "queue_p95":
+        values = (store.get("queue", {}).get(vendor, [])
+                  or store.get("queue_a", {}).get(vendor, []))
+        return percentile(values, 0.95), len(values), None
 
     if metric == "speedup_mean":
         ratios = []
@@ -428,6 +460,57 @@ def write_durations(store: dict, out_dir: str) -> None:
                 cells.append(f"{job - work:.0f}s" if job and work else "n/a")
             lines.append(f"| {workload} | {arm} | " + " | ".join(cells) + " |")
 
+    lines += ["", "# End-to-end wait, queue included", "",
+              "Median seconds from job creation to completion. This is what a",
+              "developer or an agent actually waits for.", "",
+              "| Workload | Cache | " + " | ".join([BASELINE] + VENDORS) +
+              " | ratio |",
+              "| --- | --- | " + " | ".join("---" for _ in range(len(VENDORS) + 2))
+              + " |"]
+
+    for workload in ("w1", "w2", "w4", "w5"):
+        for arm in ("cold", "warm"):
+            key = f"e2e:{workload}:{arm}"
+            if not store.get(key):
+                continue
+            base = median_of(store, key, BASELINE)
+            cells = []
+            for vendor in [BASELINE] + VENDORS:
+                cells.append(fmt(median_of(store, key, vendor), 1))
+            v = median_of(store, key, VENDORS[0])
+            ratio = f"{base / v:.2f}x" if base and v else "n/a"
+            lines.append(f"| {workload} | {arm} | " + " | ".join(cells) +
+                         f" | {ratio} |")
+
+    # Break-even: the baseline job duration at which the vendor's execution
+    # advantage exactly repays its extra provisioning latency.
+    #   base_queue + d = vendor_queue + d / r   =>   d = dq / (1 - 1/r)
+    gq = percentile(store.get("queue_a", {}).get(BASELINE, []), 0.5)
+    lines += ["", "# Break-even job length", "",
+              "Below this baseline job duration the extra provisioning latency",
+              "outweighs the faster execution, so the vendor is a regression.", "",
+              "| Vendor | queue p50 | queue penalty | exec speedup | break-even |",
+              "| --- | --- | --- | --- | --- |"]
+
+    for vendor in VENDORS:
+        vq = percentile(store.get("queue_a", {}).get(vendor, []), 0.5)
+        ratios = []
+        for wl, arm in (("w1", "warm"), ("w2", "warm"), ("w4", "warm")):
+            b = median_of(store, f"dur:{wl}:{arm}", BASELINE)
+            v = median_of(store, f"dur:{wl}:{arm}", vendor)
+            if b and v:
+                ratios.append(b / v)
+
+        r = st.median(ratios) if ratios else None
+        if gq is None or vq is None or not r or r <= 1:
+            lines.append(f"| {vendor} | {fmt(vq, 1)} | n/a | {fmt(r)} | n/a |")
+            continue
+
+        dq = vq - gq
+        be = dq / (1 - 1 / r)
+        lines.append(f"| {vendor} | {vq:.1f}s | {dq:+.1f}s | {r:.2f}x | "
+                     f"{be:.0f}s |")
+
     lines += ["", "# Cache and boot metrics", "",
               "| Metric | " + " | ".join([BASELINE] + VENDORS) + " |",
               "| --- | " + " | ".join("---" for _ in range(len(VENDORS) + 1)) + " |"]
@@ -441,7 +524,8 @@ def write_durations(store: dict, out_dir: str) -> None:
 
     queue_cells_50, queue_cells_95 = [], []
     for vendor in [BASELINE] + VENDORS:
-        values = store.get("queue", {}).get(vendor, [])
+        values = (store.get("queue", {}).get(vendor, [])
+                  or store.get("queue_a", {}).get(vendor, []))
         queue_cells_50.append(fmt(percentile(values, 0.5), 1))
         queue_cells_95.append(fmt(percentile(values, 0.95), 1))
     lines.append("| queue_p50_s | " + " | ".join(queue_cells_50) + " |")

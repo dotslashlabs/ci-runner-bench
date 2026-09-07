@@ -10,8 +10,8 @@ Runners under test:
 | --- | --- |
 | GitHub (baseline) | `ubuntu-24.04` |
 | Blacksmith | `blacksmith-4vcpu-ubuntu-2404` |
-| Namespace | `namespace-profile-bench-4x16` |
-| WarpBuild | `warp-ubuntu-latest-x64-4x` |
+
+Both runners use 4 vCPU. Namespace and WarpBuild are out of scope.
 
 ## How it works
 
@@ -42,7 +42,7 @@ All workloads are public code pinned to a fixed commit in `workloads.lock`.
 
 ```bash
 export GITHUB_TOKEN=<token with actions:read>
-export BENCH_REPO=ci-runners-org/ci-runner-bench
+export BENCH_REPO=dotslashlabs/ci-runner-bench
 python3 collector/pull_jobs.py
 python3 collector/analyze.py
 cat results/tables/verdicts.md
